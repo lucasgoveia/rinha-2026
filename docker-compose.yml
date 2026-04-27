@@ -42,18 +42,12 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:1.57
-    profiles: [observability]
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
       - "16686:16686"
     networks:
       - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "128m"
 
 networks:
   rinha:

@@ -39,14 +39,13 @@ func (t *top5) updateMax() {
 	}
 }
 
-func Score(query [14]float64, refs *References) (fraudScore float64, approved bool) {
+func Score(query [16]float32, refs *References) (fraudScore float64, approved bool) {
 	var heap top5
-	vectors := refs.Vectors
-	isFraud := refs.IsFraud
 
-	for i := range vectors {
-		d := euclideanSq(query, vectors[i])
-		heap.insert(d, isFraud[i])
+	for i := 0; i < refs.N; i++ {
+		base := i * stride
+		d := euclideanSq(query, refs.Flat[base:base+stride])
+		heap.insert(d, refs.Labels[i])
 	}
 
 	fraudCount := 0
@@ -61,10 +60,10 @@ func Score(query [14]float64, refs *References) (fraudScore float64, approved bo
 	return
 }
 
-func euclideanSq(a, b [14]float64) float64 {
+func euclideanSq(a [16]float32, b []float32) float64 {
 	var sum float64
-	for i := range a {
-		d := a[i] - b[i]
+	for i := 0; i < 14; i++ { // only compare first 14 elements (padding ignored)
+		d := float64(a[i] - b[i])
 		sum += d * d
 	}
 	return math.Sqrt(sum)

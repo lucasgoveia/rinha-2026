@@ -4,8 +4,13 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/lucasgoveia/rinha2026/internal/fraud"
 )
+
+var tracer = otel.Tracer("rinha/handler")
 
 type Handler struct {
 	Refs    *fraud.References
@@ -29,10 +34,14 @@ func (h *Handler) FraudScore(c echo.Context) error {
 	}
 
 	vec := fraud.Vectorize(&req, h.MccRisk, h.Norm)
-	score, approved := fraud.Score(vec, h.Refs)
 
-	return c.JSON(http.StatusOK, fraudScoreResponse{
-		Approved:   approved,
-		FraudScore: score,
-	})
+	_, span := tracer.Start(c.Request().Context(), "fraud.Score")
+	score, approved := fraud.Score(vec, h.Refs)
+	span.SetAttributes(
+		attribute.Float64("fraud.score", score),
+		attribute.Bool("fraud.approved", approved),
+	)
+	span.End()
+
+	return c.JSON(http.StatusOK, fraudScoreResponse{Approved: approved, FraudScore: score})
 }

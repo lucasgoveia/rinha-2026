@@ -18,6 +18,8 @@ services:
 
   api1:
     build: .
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     networks:
       - rinha
     deploy:
@@ -28,6 +30,8 @@ services:
 
   api2:
     build: .
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     networks:
       - rinha
     deploy:
@@ -35,6 +39,21 @@ services:
         limits:
           cpus: "0.4"
           memory: "160m"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    profiles: [observability]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "128m"
 
 networks:
   rinha:

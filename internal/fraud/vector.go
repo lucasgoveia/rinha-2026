@@ -50,30 +50,28 @@ type FraudScoreRequest struct {
 	LastTransaction *LastTransactionReq `json:"last_transaction"`
 }
 
-func clamp(x float64) float64 {
+func clamp(x float64) float32 {
 	if x < 0 {
 		return 0
 	}
 	if x > 1 {
 		return 1
 	}
-	return x
+	return float32(x)
 }
 
-func boolToFloat(b bool) float64 {
+func boolF32(b bool) float32 {
 	if b {
 		return 1
 	}
 	return 0
 }
 
-func Vectorize(req *FraudScoreRequest, mccRisk map[string]float64, norm NormConstants) [14]float64 {
+func Vectorize(req *FraudScoreRequest, mccRisk map[string]float64, norm NormConstants) [16]float32 {
 	t, _ := time.Parse(time.RFC3339, req.Transaction.RequestedAt)
 	hour := float64(t.UTC().Hour())
-	dow := float64(t.UTC().Weekday()+6) / 6 // Mon=0 … Sun=6 → normalize by 6
-	// time.Weekday: Sun=0, Mon=1 ... Sat=6 → shift: (wd+6)%7 gives Mon=0..Sun=6
 	wdRaw := int(t.UTC().Weekday()+6) % 7
-	dow = float64(wdRaw) / 6
+	dow := float64(wdRaw) / 6
 
 	mccRiskVal, ok := mccRisk[req.Merchant.MCC]
 	if !ok {
@@ -88,7 +86,7 @@ func Vectorize(req *FraudScoreRequest, mccRisk map[string]float64, norm NormCons
 		}
 	}
 
-	var minutesSinceLast, kmFromLast float64
+	var minutesSinceLast, kmFromLast float32
 	if req.LastTransaction == nil {
 		minutesSinceLast = -1
 		kmFromLast = -1
@@ -99,20 +97,22 @@ func Vectorize(req *FraudScoreRequest, mccRisk map[string]float64, norm NormCons
 		kmFromLast = clamp(req.LastTransaction.KmFromCurrent / norm.MaxKm)
 	}
 
-	return [14]float64{
+	return [16]float32{
 		clamp(req.Transaction.Amount / norm.MaxAmount),
 		clamp(float64(req.Transaction.Installments) / norm.MaxInstallments),
 		clamp((req.Transaction.Amount / req.Customer.AvgAmount) / norm.AmountVsAvgRatio),
-		hour / 23,
-		dow,
+		float32(hour / 23),
+		float32(dow),
 		minutesSinceLast,
 		kmFromLast,
 		clamp(req.Terminal.KmFromHome / norm.MaxKm),
 		clamp(float64(req.Customer.TxCount24h) / norm.MaxTxCount24h),
-		boolToFloat(req.Terminal.IsOnline),
-		boolToFloat(req.Terminal.CardPresent),
-		unknownMerchant,
-		mccRiskVal,
+		boolF32(req.Terminal.IsOnline),
+		boolF32(req.Terminal.CardPresent),
+		float32(unknownMerchant),
+		float32(mccRiskVal),
 		clamp(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount),
+		0, // padding
+		0, // padding
 	}
 }

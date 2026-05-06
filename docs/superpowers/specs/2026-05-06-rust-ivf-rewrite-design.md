@@ -92,11 +92,12 @@ refvec-builder \
 
 ### Pipeline
 
-**Step 1 — Read & vectorize**
+**Step 1 — Read pre-vectorized references**
 - Decompress `.json.gz` with `flate2`
-- Parse JSON array of reference records with `serde_json`
-- Apply `ivf_core::vector::vectorize()` to each record → `[f32; 16]`
-- Retain label per vector (`legit` → 0u8, `fraud` → 1u8)
+- Parse JSON array of `{"vector": [f32; 14], "label": "legit"|"fraud"}` records with `serde_json`
+- Pad each 14-dim vector to 16 dims with 0.0 (stride padding); retain label (0=legit, 1=fraud)
+- Note: `vectorize()` in ivf-core is only for API query vectors; builder reads pre-computed floats
+- Note: -1.0 sentinel values (null last_transaction) are preserved as-is, NOT clamped to 0
 
 **Step 2 — K-means++ (rayon-parallel)**
 - Init: pick first centroid randomly; each subsequent centroid selected with probability ∝ min-squared-distance to existing centroids (k-means++ seeding)
@@ -115,7 +116,8 @@ refvec-builder \
 - Per cluster: min and max per dim across all assigned vectors (in i16 after quantization)
 
 **Step 5 — Quantize**
-- f32 → i16: `clamp(v, 0.0, 1.0) * 10000.0` as i16
+- f32 → i16: `(v * 10000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16`
+- No [0,1] clamping — preserves -1.0 sentinel as -10000 i16, consistent with asymmetric query computation
 
 **Step 6 — Write `.ivfvec`**
 - Serialize header + sections in format order (Section 2), little-endian
@@ -229,12 +231,12 @@ All 6 fraud outcomes + `/ready` + 404 pre-built at compile time as `&'static [u8
 ```rust
 // ivf-core::response
 pub static RESPONSES: [&[u8]; 6] = [
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 34\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 34\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 34\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
-    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 ];
 
 pub static READY_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";

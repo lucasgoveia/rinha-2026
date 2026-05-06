@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/ivf-core", "crates/refvec-builder", "crates/api"]
+resolver = "2"

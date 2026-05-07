@@ -117,7 +117,7 @@ mod tests {
         for _ in 0..20 { vectors.push([0.95; 16]); }
 
         let config = KMeansConfig { n_clusters: 2, max_iters: 20, change_tol: 1e-4 };
-        let (centroids, assignments) = fit(&vectors, &config, 42);
+        let (_centroids, assignments) = fit(&vectors, &config, 42);
 
         let cluster_of_first = assignments[0];
         let cluster_of_last = assignments[20];

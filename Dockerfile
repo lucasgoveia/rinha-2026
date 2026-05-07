@@ -1,13 +1,12 @@
-FROM golang:1.26-alpine AS builder
+FROM rust:1.87-alpine AS builder
+RUN apk add --no-cache musl-dev
 WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api ./cmd/api
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build -p api --release
 
 FROM alpine:3.20
 WORKDIR /app
-COPY --from=builder /app/api .
-COPY resources/ ./resources/
+COPY --from=builder /app/target/release/api .
 EXPOSE 9999
 CMD ["./api"]

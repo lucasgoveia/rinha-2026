@@ -20,23 +20,37 @@ const BUF_SIZE: usize = 65536;
 
 pub async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> std::io::Result<()> {
     let mut buf = vec![0u8; BUF_SIZE];
+    let mut filled = 0usize;
 
     loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 { return Ok(()); }
+        // Read more data into remaining buffer space
+        let n = stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        filled += n;
 
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
 
-        let body_start = match req.parse(&buf[..n]) {
+        let body_start = match req.parse(&buf[..filled]) {
             Ok(httparse::Status::Complete(offset)) => offset,
-            _ => {
+            Ok(httparse::Status::Partial) => {
+                // Headers not fully received yet — read more (loop again)
+                // If buffer is full, the request is too large
+                if filled == BUF_SIZE {
+                    stream.write_all(response::BAD_REQUEST).await?;
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(_) => {
                 stream.write_all(response::BAD_REQUEST).await?;
                 return Ok(());
             }
         };
 
-        let body = &buf[body_start..n];
+        let body = &buf[body_start..filled];
 
         let resp: &[u8] = match (req.method, req.path) {
             (Some("GET"), Some("/ready")) => response::READY_RESPONSE,
@@ -52,7 +66,12 @@ pub async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> std::io::Res
                     .unwrap_or("")
                     .eq_ignore_ascii_case("close")
         });
-        if close { return Ok(()); }
+        if close {
+            return Ok(());
+        }
+
+        // Reset buffer for next request on keep-alive connection
+        filled = 0;
     }
 }
 

@@ -84,23 +84,27 @@ pub fn vectorize(
     let (hour, weekday) = hour_weekday(requested_at);
 
     let mut v = [0.0f32; STRIDE];
-    v[0]  = clamp_ratio(req.transaction.amount, norm.max_amount);
-    v[1]  = clamp_ratio(req.transaction.installments as f32, norm.max_installments);
-    v[2]  = normalize_amount_vs_avg(req.transaction.amount, req.customer.avg_amount, norm.amount_vs_avg_ratio);
-    v[3]  = hour as f32 / 23.0;
-    v[4]  = weekday as f32 / 6.0;
-    v[5]  = minutes_since_last;
-    v[6]  = km_from_last;
-    v[7]  = clamp_ratio(req.terminal.km_from_home, norm.max_km);
-    v[8]  = clamp_ratio(req.customer.tx_count_24h as f32, norm.max_tx_count_24h);
+    v[0]  = round4(clamp_ratio(req.transaction.amount, norm.max_amount));
+    v[1]  = round4(clamp_ratio(req.transaction.installments as f32, norm.max_installments));
+    v[2]  = round4(normalize_amount_vs_avg(req.transaction.amount, req.customer.avg_amount, norm.amount_vs_avg_ratio));
+    v[3]  = round4(hour as f32 / 23.0);
+    v[4]  = round4(weekday as f32 / 6.0);
+    v[5]  = round4(minutes_since_last);
+    v[6]  = round4(km_from_last);
+    v[7]  = round4(clamp_ratio(req.terminal.km_from_home, norm.max_km));
+    v[8]  = round4(clamp_ratio(req.customer.tx_count_24h as f32, norm.max_tx_count_24h));
     v[9]  = if req.terminal.is_online { 1.0 } else { 0.0 };
     v[10] = if req.terminal.card_present { 1.0 } else { 0.0 };
     v[11] = unknown_merchant;
-    v[12] = mcc_risk;
-    v[13] = clamp_ratio(req.merchant.avg_amount, norm.max_merchant_avg_amount);
+    v[12] = round4(mcc_risk);
+    v[13] = round4(clamp_ratio(req.merchant.avg_amount, norm.max_merchant_avg_amount));
     // v[14], v[15] stay 0.0 (stride padding)
 
     Ok(v)
+}
+
+fn round4(x: f32) -> f32 {
+    (x * 10000.0).round() * 0.0001
 }
 
 fn clamp_ratio(value: f32, max: f32) -> f32 {
@@ -204,7 +208,7 @@ mod tests {
 
         fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 0.0001 }
 
-        assert!(approx(v[0], 0.004112));   // amount / max_amount
+        assert!(approx(v[0], 0.0041));     // amount / max_amount (round4 applied)
         assert!(approx(v[1], 0.16667));    // installments / max_installments
         assert!(approx(v[2], 0.05));       // amount_vs_avg normalized
         assert!(approx(v[3], 0.78261));    // hour 18 / 23

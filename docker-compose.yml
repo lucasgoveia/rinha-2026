@@ -1,8 +1,9 @@
 services:
-  nginx:
-    image: nginx:alpine
+  lb:
+    image: haproxy:alpine
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     ports:
       - "9999:9999"
     depends_on:
@@ -19,7 +20,9 @@ services:
   api1:
     build: .
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      SOCK: /run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
     networks:
       - rinha
     deploy:
@@ -31,7 +34,9 @@ services:
   api2:
     build: .
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      SOCK: /run/sock/api2.sock
+    volumes:
+      - sock:/run/sock
     networks:
       - rinha
     deploy:
@@ -40,15 +45,14 @@ services:
           cpus: "0.4"
           memory: "160m"
 
-  jaeger:
-    image: jaegertracing/all-in-one:1.57
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports:
-      - "16686:16686"
-    networks:
-      - rinha
-
 networks:
   rinha:
     driver: bridge
+
+volumes:
+  sock:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: uid=0,gid=0

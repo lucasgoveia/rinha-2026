@@ -5,12 +5,13 @@ import { Counter } from 'k6/metrics';
 import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 import exec from 'k6/execution';
 
-const testFile = JSON.parse(open('./test-data.json'));
-const expectedStats = testFile.stats;
-
 const testData = new SharedArray('test-data', function () {
-    return testFile.entries;
+    return JSON.parse(open('./test-data.json')).entries;
 });
+const statsArr = new SharedArray('test-stats', function () {
+    return [JSON.parse(open('./test-data.json')).stats];
+});
+const expectedStats = statsArr[0];
 
 const tpCount = new Counter('tp_count');
 const tnCount = new Counter('tn_count');
@@ -20,6 +21,7 @@ const errorCount = new Counter('error_count');
 
 export const options = {
     summaryTrendStats: ['p(99)'],
+    systemTags: ['status', 'method'],
     dns: {
         ttl: '5m',
         select: 'roundRobin',
@@ -29,11 +31,11 @@ export const options = {
             executor: 'ramping-arrival-rate',
             startRate: 1,
             timeUnit: '1s',
-            preAllocatedVUs: 10,
-            maxVUs: 50,
+            preAllocatedVUs: 100,
+            maxVUs: 250,
             gracefulStop: '10s',
             stages: [
-                { duration: '120s', target: 650 },
+                { duration: '120s', target: 850 },
             ],
         },
     },
@@ -57,7 +59,7 @@ export default function () {
     const res = http.post(
         'http://localhost:9999/fraud-score',
         JSON.stringify(entry.request),
-        { headers: { 'Content-Type': 'application/json' }, timeout: '1500ms' }
+        { headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' }
     );
 
     if (res.status === 200) {
@@ -163,7 +165,7 @@ export function handleSummary(data) {
     };
 
     return {
-        './test/results.json': JSON.stringify(result, null, 2),
+        'test/results.json': JSON.stringify(result, null, 2),
         //stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }

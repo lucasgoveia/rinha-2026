@@ -1,0 +1,10 @@
+{
+    "participants": ["Lucas Goveia"],
+    "social": [
+        "https://github.com/lucasgoveia",
+        "https://www.linkedin.com/in/lucas-goveia/"
+    ],
+    "source-code-repo": "https://github.com/lucasgoveia/rinha-2026",
+    "stack": ["rust", "haproxy"],
+    "open_to_work": true
+}

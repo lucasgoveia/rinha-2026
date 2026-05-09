@@ -7,7 +7,7 @@ use ivf_core::{
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 
 pub struct AppState {
     pub index: IvfIndex,
@@ -18,7 +18,7 @@ pub struct AppState {
 
 const BUF_SIZE: usize = 65536;
 
-pub async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> std::io::Result<()> {
+pub async fn handle(mut stream: UnixStream, state: Arc<AppState>) -> std::io::Result<()> {
     let mut buf = vec![0u8; BUF_SIZE];
     let mut filled = 0usize;
 

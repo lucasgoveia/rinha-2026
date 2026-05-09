@@ -4,7 +4,6 @@ use crate::simd::L2_F32;
 pub struct KMeansConfig {
     pub n_clusters: usize,
     pub max_iters: usize,
-    pub change_tol: f64,
 }
 
 /// Returns (centroids: Vec<f32> of shape n_clusters×16, assignments: Vec<usize>)
@@ -13,7 +12,7 @@ pub fn fit(vectors: &[[f32; 16]], config: &KMeansConfig, seed: u64) -> (Vec<f32>
     let k = config.n_clusters;
     let mut rng = seed.wrapping_add(1);
 
-    let sample_size = n.min(10_000);
+    let sample_size = n.min(50_000);
     let step = n / sample_size.max(1);
     let subsample: Vec<&[f32; 16]> = (0..sample_size).map(|i| &vectors[i * step]).collect();
 
@@ -53,7 +52,7 @@ pub fn fit(vectors: &[[f32; 16]], config: &KMeansConfig, seed: u64) -> (Vec<f32>
 
         let change_frac = changes as f64 / n as f64;
         eprintln!("kmeans iter {}/{}: {:.2}% changed", iter + 1, config.max_iters, change_frac * 100.0);
-        if change_frac < config.change_tol { break; }
+        if change_frac < 1e-4 { break; }
     }
 
     (centroids, assignments)
@@ -116,7 +115,7 @@ mod tests {
         for _ in 0..20 { vectors.push([0.05; 16]); }
         for _ in 0..20 { vectors.push([0.95; 16]); }
 
-        let config = KMeansConfig { n_clusters: 2, max_iters: 20, change_tol: 1e-4 };
+        let config = KMeansConfig { n_clusters: 2, max_iters: 20 };
         let (_centroids, assignments) = fit(&vectors, &config, 42);
 
         let cluster_of_first = assignments[0];
@@ -130,7 +129,7 @@ mod tests {
     fn fit_returns_correct_shapes() {
         crate::simd::init();
         let vectors: Vec<[f32; 16]> = (0..50).map(|i| [i as f32 / 50.0; 16]).collect();
-        let config = KMeansConfig { n_clusters: 5, max_iters: 10, change_tol: 1e-4 };
+        let config = KMeansConfig { n_clusters: 5, max_iters: 10 };
         let (centroids, assignments) = fit(&vectors, &config, 0);
         assert_eq!(centroids.len(), 5 * 16);
         assert_eq!(assignments.len(), 50);

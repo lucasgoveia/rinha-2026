@@ -1,0 +1,6 @@
+target/
+.zig-cache/
+.claude/
+*.swp
+.DS_Store
+resources/references.ivfvec

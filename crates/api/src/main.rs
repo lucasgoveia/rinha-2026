@@ -2,7 +2,6 @@ mod http;
 
 use http::AppState;
 use ivf_core::{
-    engine,
     format::IvfIndex,
     norm::{MerchantRiskConfig, NormalizationConfig},
     simd,
@@ -32,20 +31,6 @@ async fn main() {
     let index = IvfIndex::load(format!("{resources}/references.ivfvec"))
         .expect("load references.ivfvec");
     eprintln!("loaded {} vectors, {} clusters", index.n_vectors, index.n_clusters);
-
-    // Warmup: random queries prime L1/L2/TLB and branch predictor.
-    {
-        let mut state = 0x12345678u32;
-        for _ in 0..1000 {
-            let mut q = [0.0f32; 16];
-            for v in q.iter_mut() {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                *v = (state >> 8) as f32 / (1u32 << 24) as f32;
-            }
-            let _ = engine::search(&q, &index, 0);
-        }
-        eprintln!("warmup done");
-    }
 
     let state = Arc::new(AppState { index, norm, merchs, nprobe });
 

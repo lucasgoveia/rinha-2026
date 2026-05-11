@@ -18,7 +18,7 @@ services:
           memory: "30m"
 
   api1:
-    image: lucasgoveia/rinha-2026:latest
+    image: lucasgoveia/rinha-2026:c56ef01
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -32,7 +32,7 @@ services:
           memory: "160m"
 
   api2:
-    image: lucasgoveia/rinha-2026:latest
+    image: lucasgoveia/rinha-2026:c56ef01
     environment:
       SOCK: /run/sock/api2.sock
     volumes:

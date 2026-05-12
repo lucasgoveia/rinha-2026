@@ -1,58 +1,45 @@
 services:
+  api1: &api
+    image: lucasgoveia/rinha-2026:c56ef01
+    environment:
+      - SOCK=/run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "160M"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  api2:
+    <<: *api
+    environment:
+      - SOCK=/run/sock/api2.sock
+
   lb:
     image: haproxy:alpine
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - sock:/run/sock
-    ports:
-      - "9999:9999"
+    restart: always
     depends_on:
       - api1
       - api2
-    networks:
-      - rinha
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     deploy:
       resources:
         limits:
           cpus: "0.2"
-          memory: "30m"
-
-  api1:
-    image: lucasgoveia/rinha-2026:c56ef01
-    environment:
-      SOCK: /run/sock/api1.sock
-    volumes:
-      - sock:/run/sock
-    networks:
-      - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.4"
-          memory: "160m"
-
-  api2:
-    image: lucasgoveia/rinha-2026:c56ef01
-    environment:
-      SOCK: /run/sock/api2.sock
-    volumes:
-      - sock:/run/sock
-    networks:
-      - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.4"
-          memory: "160m"
-
-networks:
-  rinha:
-    driver: bridge
+          memory: "30M"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
 volumes:
   sock:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: uid=0,gid=0

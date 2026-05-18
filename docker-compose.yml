@@ -16,9 +16,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    sysctls:
-      - net.core.somaxconn=65535
-      - net.ipv4.tcp_syncookies=0
     deploy:
       resources:
         limits:

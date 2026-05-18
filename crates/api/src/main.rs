@@ -16,7 +16,7 @@ use tokio::net::UnixListener;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     simd::init();
 

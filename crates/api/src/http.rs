@@ -1,13 +1,15 @@
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{header, header::HeaderValue, Method, Request, Response, StatusCode};
+use hyper::body::Incoming;
 use ivf_core::{
     engine::search,
     format::IvfIndex,
     norm::{MerchantRiskConfig, NormalizationConfig},
-    response,
     vector::{vectorize, FraudScoreRequest},
 };
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use std::convert::Infallible;
+use std::sync::{Arc, LazyLock};
 
 pub struct AppState {
     pub index: IvfIndex,
@@ -16,74 +18,65 @@ pub struct AppState {
     pub nprobe: usize,
 }
 
-const BUF_SIZE: usize = 65536;
+static FRAUD_BODIES: LazyLock<[Bytes; 6]> = LazyLock::new(|| [
+    Bytes::from_static(b"{\"approved\":true,\"fraud_score\":0.0}"),
+    Bytes::from_static(b"{\"approved\":true,\"fraud_score\":0.2}"),
+    Bytes::from_static(b"{\"approved\":true,\"fraud_score\":0.4}"),
+    Bytes::from_static(b"{\"approved\":false,\"fraud_score\":0.6}"),
+    Bytes::from_static(b"{\"approved\":false,\"fraud_score\":0.8}"),
+    Bytes::from_static(b"{\"approved\":false,\"fraud_score\":1.0}"),
+]);
 
-pub async fn handle(mut stream: UnixStream, state: Arc<AppState>) -> std::io::Result<()> {
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut filled = 0usize;
+static JSON_CT: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static("application/json"));
 
-    loop {
-        // Read more data into remaining buffer space
-        let n = stream.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        filled += n;
-
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut req = httparse::Request::new(&mut headers);
-
-        let body_start = match req.parse(&buf[..filled]) {
-            Ok(httparse::Status::Complete(offset)) => offset,
-            Ok(httparse::Status::Partial) => {
-                // Headers not fully received yet — read more (loop again)
-                // If buffer is full, the request is too large
-                if filled == BUF_SIZE {
-                    stream.write_all(response::BAD_REQUEST).await?;
-                    return Ok(());
-                }
-                continue;
-            }
-            Err(_) => {
-                stream.write_all(response::BAD_REQUEST).await?;
-                return Ok(());
-            }
-        };
-
-        let body = &buf[body_start..filled];
-
-        let resp: &[u8] = match (req.method, req.path) {
-            (Some("GET"), Some("/ready")) => response::READY_RESPONSE,
-            (Some("POST"), Some("/fraud-score")) => handle_fraud_score(body, &state),
-            _ => response::NOT_FOUND,
-        };
-
-        stream.write_all(resp).await?;
-
-        let close = req.headers.iter().any(|h| {
-            h.name.eq_ignore_ascii_case("connection")
-                && std::str::from_utf8(h.value)
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case("close")
-        });
-        if close {
-            return Ok(());
-        }
-
-        // Reset buffer for next request on keep-alive connection
-        filled = 0;
-    }
+pub async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let resp = match (req.method(), req.uri().path()) {
+        (&Method::GET, "/ready") => ready_response(),
+        (&Method::POST, "/fraud-score") => handle_fraud_score(req, &state).await,
+        _ => not_found_response(),
+    };
+    Ok(resp)
 }
 
-fn handle_fraud_score(body: &[u8], state: &AppState) -> &'static [u8] {
-    let req: FraudScoreRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => return response::BAD_REQUEST,
+async fn handle_fraud_score(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+    let body = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return bad_request_response(),
     };
-    let query = match vectorize(&req, &state.norm, &state.merchs) {
+    let fraud_req: FraudScoreRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_request_response(),
+    };
+    let query = match vectorize(&fraud_req, &state.norm, &state.merchs) {
         Ok(v) => v,
-        Err(_) => return response::BAD_REQUEST,
+        Err(_) => return bad_request_response(),
     };
     let fraud_count = search(&query, &state.index, state.nprobe);
-    response::RESPONSES[fraud_count]
+    fraud_score_response(fraud_count)
+}
+
+fn fraud_score_response(n: usize) -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(FRAUD_BODIES[n].clone()));
+    resp.headers_mut().insert(header::CONTENT_TYPE, JSON_CT.clone());
+    resp
+}
+
+fn ready_response() -> Response<Full<Bytes>> {
+    Response::new(Full::new(Bytes::new()))
+}
+
+fn not_found_response() -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::NOT_FOUND;
+    resp
+}
+
+fn bad_request_response() -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
 }

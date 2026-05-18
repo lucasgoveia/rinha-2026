@@ -26,6 +26,18 @@ fn top_n<const N: usize>(dists: &[f32]) -> [usize; N] {
     result
 }
 
+fn top_n_dynamic(dists: &[f32], n: usize) -> Vec<usize> {
+    let n = n.min(dists.len());
+    if n == dists.len() {
+        return (0..dists.len()).collect();
+    }
+
+    let mut ids: Vec<usize> = (0..dists.len()).collect();
+    ids.select_nth_unstable_by(n - 1, |&a, &b| dists[a].total_cmp(&dists[b]));
+    ids.truncate(n);
+    ids
+}
+
 fn scan_probes(
     query: &[f32; 16],
     index: &IvfIndex,
@@ -45,6 +57,17 @@ fn scan_probes(
     }
 
     top.iter().filter(|(_, l)| *l == 1).count()
+}
+
+pub fn search_nprobe(query: &[f32; 16], index: &IvfIndex, nprobe: usize) -> usize {
+    let k = index.n_clusters as usize;
+    let cdists_fn = CENTROID_DISTS.get().expect("simd::init() not called");
+
+    let mut cdists = vec![0.0f32; k];
+    cdists_fn(query, &index.centroids, k, &mut cdists);
+
+    let probes = top_n_dynamic(&cdists, nprobe.clamp(1, k));
+    scan_probes(query, index, &probes)
 }
 
 pub fn search(query: &[f32; 16], index: &IvfIndex, _nprobe: usize) -> usize {

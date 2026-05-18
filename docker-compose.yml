@@ -1,6 +1,6 @@
 services:
   lb:
-    image: haproxy:alpine
+    image: docker.io/library/haproxy:alpine
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sock:/run/sock
@@ -11,6 +11,14 @@ services:
       - api2
     networks:
       - rinha
+    restart: always
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    sysctls:
+      - net.core.somaxconn=65535
+      - net.ipv4.tcp_syncookies=0
     deploy:
       resources:
         limits:
@@ -18,13 +26,18 @@ services:
           memory: "30m"
 
   api1:
-    image: lucasgoveia/rinha-2026:latest
+    build: .
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
       - sock:/run/sock
     networks:
       - rinha
+    restart: always
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     deploy:
       resources:
         limits:
@@ -32,13 +45,18 @@ services:
           memory: "160m"
 
   api2:
-    image: lucasgoveia/rinha-2026:latest
+    build: .
     environment:
       SOCK: /run/sock/api2.sock
     volumes:
       - sock:/run/sock
     networks:
       - rinha
+    restart: always
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     deploy:
       resources:
         limits:
@@ -48,6 +66,8 @@ services:
 networks:
   rinha:
     driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "65535"
 
 volumes:
   sock:

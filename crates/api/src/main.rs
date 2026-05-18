@@ -1,6 +1,9 @@
 mod http;
 
 use http::AppState;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use ivf_core::{
     format::IvfIndex,
     norm::{MerchantRiskConfig, NormalizationConfig},
@@ -13,7 +16,7 @@ use tokio::net::UnixListener;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     simd::init();
 
@@ -46,9 +49,19 @@ async fn main() {
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = http::handle(stream, state).await {
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .half_close(false)
+                .writev(true)
+                .max_buf_size(16 * 1024)
+                .preserve_header_case(false)
+                .title_case_headers(false)
+                .serve_connection(io, service_fn(move |req| http::handle_request(req, Arc::clone(&state))))
+                .await
+            {
                 eprintln!("connection error: {e}");
             }
         });

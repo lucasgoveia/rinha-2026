@@ -23,7 +23,7 @@ services:
           memory: "30m"
 
   api1:
-    image: docker.io/goveialucas/rinha-2026:27ede208b5b0
+    image: docker.io/goveialucas/rinha-2026:5354892
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -42,7 +42,7 @@ services:
           memory: "160m"
 
   api2:
-    image: docker.io/goveialucas/rinha-2026:27ede208b5b0
+    image: docker.io/goveialucas/rinha-2026:5354892
     environment:
       SOCK: /run/sock/api2.sock
     volumes:

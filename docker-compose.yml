@@ -15,9 +15,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    sysctls:
-      - net.core.somaxconn=65535
-      - net.ipv4.tcp_syncookies=0
     deploy:
       resources:
         limits:
@@ -33,11 +30,6 @@ services:
     networks:
       - rinha
     restart: always
-    cap_add:
-      - IPC_LOCK
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
@@ -60,11 +52,6 @@ services:
     networks:
       - rinha
     restart: always
-    cap_add:
-      - IPC_LOCK
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384

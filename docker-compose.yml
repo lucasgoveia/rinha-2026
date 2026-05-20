@@ -1,8 +1,7 @@
 services:
   lb:
-    image: docker.io/library/haproxy:alpine
+    build: ./lb
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sock:/run/sock
     ports:
       - "9999:9999"
@@ -26,7 +25,9 @@ services:
           memory: "30m"
 
   api1:
-    build: .
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -34,10 +35,18 @@ services:
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
         hard: 16384
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -45,7 +54,9 @@ services:
           memory: "160m"
 
   api2:
-    build: .
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api2.sock
     volumes:
@@ -53,10 +64,18 @@ services:
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
         hard: 16384
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:

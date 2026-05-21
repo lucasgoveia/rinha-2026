@@ -1,6 +1,6 @@
 services:
   lb:
-    image: docker.io/goveialucas/rinha-2026-lb:159a0b5
+    image: docker.io/goveialucas/rinha-2026-lb:00b0235
     volumes:
       - sock:/run/sock
     ports:
@@ -22,7 +22,7 @@ services:
           memory: "30m"
 
   api1:
-    image: docker.io/goveialucas/rinha-2026:159a0b5
+    image: docker.io/goveialucas/rinha-2026:00b0235
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -44,7 +44,7 @@ services:
           memory: "160m"
 
   api2:
-    image: docker.io/goveialucas/rinha-2026:159a0b5
+    image: docker.io/goveialucas/rinha-2026:00b0235
     environment:
       SOCK: /run/sock/api2.sock
     volumes:

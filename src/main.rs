@@ -1,4 +1,3 @@
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use api_lib::ivf;
@@ -6,8 +5,6 @@ use api_lib::vectorize;
 
 const BUF_SIZE: usize = 8192;
 const MAX_CONNS: usize = 128;
-const EPOLL_BATCH: usize = 128;
-const LISTEN_TOKEN: u64 = u64::MAX;
 
 const RESP_READY: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
@@ -31,16 +28,6 @@ struct Conn {
     buf_len: usize,
     write_resp: &'static [u8],
     write_pos: usize,
-}
-
-fn epoll_add(epfd: i32, fd: i32, token: u64, flags: u32) {
-    let mut ev = libc::epoll_event { events: flags, u64: token };
-    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
-}
-
-fn epoll_mod(epfd: i32, fd: i32, token: u64, flags: u32) {
-    let mut ev = libc::epoll_event { events: flags, u64: token };
-    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
 }
 
 fn make_unix_listener(path: &str) -> i32 {
@@ -69,7 +56,6 @@ fn make_unix_listener(path: &str) -> i32 {
     }
 }
 
-// Fast byte-by-byte CRLFCRLF scan (no windows().position() overhead).
 #[inline(always)]
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 { return None; }
@@ -95,7 +81,6 @@ fn parse_content_length(headers: &[u8]) -> usize {
     let mut i = 0;
     let end = headers.len() - needle.len();
     while i <= end {
-        // Case-insensitive on first char (C vs c) is fine — top compatible clients send Content-Length
         if headers[i] == b'C' && &headers[i..i + needle.len()] == needle {
             let mut j = i + needle.len();
             while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') { j += 1; }
@@ -115,149 +100,38 @@ fn parse_content_length(headers: &[u8]) -> usize {
 
 #[inline(always)]
 fn route(headers: &[u8], body: &[u8]) -> &'static [u8] {
-    if headers.starts_with(b"GET /ready ") { return RESP_READY; }
-    if headers.starts_with(b"POST /fraud-score ") {
-        let idx = unsafe { &*IDX_PTR.load(Ordering::Relaxed) };
-        let vec = vectorize::parse_body(body);
-        let fraud_count = idx.query(&vec);
-        return FRAUD_RESPS[fraud_count.min(5) as usize];
+    match headers.first().copied() {
+        Some(b'P') => {
+            if headers.starts_with(b"POST /fraud-score ") {
+                let idx = unsafe { &*IDX_PTR.load(Ordering::Relaxed) };
+                let vec = vectorize::parse_body(body);
+                let fraud_count = idx.query(&vec).min(5) as usize;
+                return unsafe { *FRAUD_RESPS.get_unchecked(fraud_count) };
+            }
+        }
+        Some(b'G') => {
+            if headers.starts_with(b"GET /ready ") { return RESP_READY; }
+        }
+        _ => {}
     }
     RESP_404
 }
 
-fn flush_write(conn: &mut Conn) -> bool {
-    while conn.write_pos < conn.write_resp.len() {
-        let n = unsafe {
-            libc::send(
-                conn.fd,
-                conn.write_resp[conn.write_pos..].as_ptr() as *const libc::c_void,
-                conn.write_resp.len() - conn.write_pos,
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if n < 0 {
-            let e = unsafe { *libc::__errno_location() };
-            if e == libc::EAGAIN || e == libc::EWOULDBLOCK { return true; }
-            return false;
-        }
-        conn.write_pos += n as usize;
-    }
-    true
-}
-
-enum ProcResult { Processed, NeedMore, WriteBlocked, Error }
-
-fn try_process_one(conn: &mut Conn, slot: usize, epfd: i32) -> ProcResult {
-    if conn.write_pos < conn.write_resp.len() { return ProcResult::WriteBlocked; }
-    if conn.buf_len == 0 { return ProcResult::NeedMore; }
-
-    let Some(hdr_end) = find_crlfcrlf(&conn.buf[..conn.buf_len]) else {
-        return ProcResult::NeedMore;
-    };
-
+fn try_process_one(conn: &mut Conn) -> Option<&'static [u8]> {
+    if conn.buf_len == 0 { return None; }
+    let hdr_end = find_crlfcrlf(&conn.buf[..conn.buf_len])?;
     let content_length = parse_content_length(&conn.buf[..hdr_end]);
     let body_start = hdr_end + 4;
     let body_in_buf = conn.buf_len.saturating_sub(body_start);
-
-    if body_in_buf < content_length {
-        return ProcResult::NeedMore;
-    }
+    if body_in_buf < content_length { return None; }
 
     let resp = route(&conn.buf[..hdr_end], &conn.buf[body_start..body_start + content_length]);
-    conn.write_resp = resp;
-    conn.write_pos = 0;
 
     let next_start = body_start + content_length;
     conn.buf.copy_within(next_start..conn.buf_len, 0);
     conn.buf_len -= next_start;
 
-    if !flush_write(conn) { return ProcResult::Error; }
-
-    if conn.write_pos < conn.write_resp.len() {
-        epoll_mod(epfd, conn.fd, slot as u64,
-            libc::EPOLLIN as u32 | libc::EPOLLOUT as u32 | libc::EPOLLET as u32);
-        return ProcResult::WriteBlocked;
-    }
-
-    ProcResult::Processed
-}
-
-fn process_loop(slot: usize, epfd: i32, conns: &mut Vec<Option<Conn>>) -> bool {
-    loop {
-        let conn = match conns[slot].as_mut() { Some(c) => c, None => return false };
-        match try_process_one(conn, slot, epfd) {
-            ProcResult::Processed => continue,
-            ProcResult::NeedMore | ProcResult::WriteBlocked => return true,
-            ProcResult::Error => return false,
-        }
-    }
-}
-
-fn close_conn(slot: usize, epfd: i32, conns: &mut Vec<Option<Conn>>) {
-    if let Some(c) = conns[slot].take() {
-        unsafe {
-            libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, c.fd, null_mut());
-            libc::close(c.fd);
-        }
-    }
-}
-
-fn drain_accept(listen_fd: i32, epfd: i32, conns: &mut Vec<Option<Conn>>) {
-    loop {
-        let fd = unsafe { libc::accept4(listen_fd, null_mut(), null_mut(), libc::SOCK_NONBLOCK) };
-        if fd < 0 { break; }
-        match conns.iter().position(|c| c.is_none()) {
-            None => unsafe { libc::close(fd); },
-            Some(i) => {
-                conns[i] = Some(Conn {
-                    fd,
-                    buf: [0; BUF_SIZE],
-                    buf_len: 0,
-                    write_resp: b"",
-                    write_pos: 0,
-                });
-                epoll_add(epfd, fd, i as u64, libc::EPOLLIN as u32 | libc::EPOLLET as u32);
-            }
-        }
-    }
-}
-
-fn handle_conn(slot: usize, events: u32, epfd: i32, conns: &mut Vec<Option<Conn>>) {
-    if events & libc::EPOLLOUT as u32 != 0 {
-        {
-            let conn = match conns[slot].as_mut() { Some(c) => c, None => return };
-            if !flush_write(conn) { close_conn(slot, epfd, conns); return; }
-            if conn.write_pos < conn.write_resp.len() { return; }
-            let fd = conn.fd;
-            epoll_mod(epfd, fd, slot as u64, libc::EPOLLIN as u32 | libc::EPOLLET as u32);
-        }
-        if !process_loop(slot, epfd, conns) { close_conn(slot, epfd, conns); return; }
-        if conns[slot].is_none() { return; }
-    }
-
-    if events & libc::EPOLLIN as u32 != 0 {
-        loop {
-            let conn = match conns[slot].as_mut() { Some(c) => c, None => return };
-            let space = BUF_SIZE - conn.buf_len;
-            if space == 0 { close_conn(slot, epfd, conns); return; }
-            let n = unsafe {
-                libc::recv(conn.fd, conn.buf[conn.buf_len..].as_mut_ptr() as *mut libc::c_void, space, 0)
-            };
-            if n == 0 { close_conn(slot, epfd, conns); return; }
-            if n < 0 {
-                let e = unsafe { *libc::__errno_location() };
-                if e == libc::EAGAIN || e == libc::EWOULDBLOCK { break; }
-                close_conn(slot, epfd, conns); return;
-            }
-            conns[slot].as_mut().unwrap().buf_len += n as usize;
-            if !process_loop(slot, epfd, conns) { close_conn(slot, epfd, conns); return; }
-            if conns[slot].is_none() { return; }
-        }
-    }
-
-    if events & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0 {
-        if events & libc::EPOLLIN as u32 == 0 { close_conn(slot, epfd, conns); }
-    }
+    Some(resp)
 }
 
 fn try_sched_fifo() {
@@ -267,9 +141,26 @@ fn try_sched_fifo() {
         let rc = libc::sched_setscheduler(0, libc::SCHED_FIFO, &p);
         if rc != 0 {
             let e = *libc::__errno_location();
-            eprintln!("[sched] sched_setscheduler SCHED_FIFO failed errno={} (continuing on SCHED_OTHER)", e);
+            eprintln!("[sched] SCHED_FIFO failed errno={} (continuing on SCHED_OTHER)", e);
         } else {
             eprintln!("[sched] SCHED_FIFO prio=10");
+        }
+    }
+}
+
+const SLOT_ACCEPT: u64 = u64::MAX;
+
+#[inline(always)]
+fn epoll_mod(epfd: i32, fd: i32, events: u32, slot: u64) {
+    let mut ev = libc::epoll_event { events, u64: slot };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
+}
+
+fn close_conn(slot: usize, conns: &mut [Option<Conn>; MAX_CONNS], epfd: i32) {
+    if let Some(c) = conns[slot].take() {
+        unsafe {
+            libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, c.fd, std::ptr::null_mut());
+            libc::close(c.fd);
         }
     }
 }
@@ -291,24 +182,121 @@ fn main() {
 
     let listen_fd = make_unix_listener(&sock_path);
 
-    let epfd = unsafe { libc::epoll_create1(0) };
-    assert!(epfd >= 0);
-    epoll_add(epfd, listen_fd, LISTEN_TOKEN, libc::EPOLLIN as u32 | libc::EPOLLET as u32);
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    assert!(epfd >= 0, "epoll_create1 failed");
 
-    let mut conns: Vec<Option<Conn>> = (0..MAX_CONNS).map(|_| None).collect();
-    let mut events: Vec<libc::epoll_event> =
-        (0..EPOLL_BATCH).map(|_| libc::epoll_event { events: 0, u64: 0 }).collect();
+    let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: SLOT_ACCEPT };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut ev) };
+
+    let mut conns: Box<[Option<Conn>; MAX_CONNS]> =
+        Box::new(std::array::from_fn(|_| None));
+
+    let mut epevents = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
+    // Snapshot buffer to avoid borrow conflicts during processing.
+    let mut batch: Vec<(u64, u32)> = Vec::with_capacity(256);
 
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), EPOLL_BATCH as i32, -1) };
-        if n < 0 { continue; }
+        let n = unsafe {
+            libc::epoll_wait(epfd, epevents.as_mut_ptr(), epevents.len() as i32, -1)
+        };
+        if n < 0 {
+            let e = unsafe { *libc::__errno_location() };
+            if e == libc::EINTR { continue; }
+            break;
+        }
+
+        batch.clear();
         for i in 0..n as usize {
-            let token = events[i].u64;
-            let evflags = events[i].events;
-            if token == LISTEN_TOKEN {
-                drain_accept(listen_fd, epfd, &mut conns);
-            } else {
-                handle_conn(token as usize, evflags, epfd, &mut conns);
+            batch.push((epevents[i].u64, epevents[i].events));
+        }
+
+        for &(ud, evflags) in &batch {
+            if ud == SLOT_ACCEPT {
+                loop {
+                    let fd = unsafe {
+                        libc::accept4(listen_fd, std::ptr::null_mut(), std::ptr::null_mut(),
+                            libc::SOCK_NONBLOCK)
+                    };
+                    if fd < 0 { break; }
+                    match conns.iter().position(|c| c.is_none()) {
+                        None => unsafe { libc::close(fd); },
+                        Some(slot) => {
+                            conns[slot] = Some(Conn {
+                                fd,
+                                buf: [0; BUF_SIZE],
+                                buf_len: 0,
+                                write_resp: b"",
+                                write_pos: 0,
+                            });
+                            let mut ev = libc::epoll_event {
+                                events: libc::EPOLLIN as u32,
+                                u64: slot as u64,
+                            };
+                            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let slot = ud as usize;
+            if conns[slot].is_none() { continue; }
+
+            if evflags & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+                close_conn(slot, &mut conns, epfd);
+                continue;
+            }
+
+            if evflags & libc::EPOLLIN as u32 != 0 {
+                let conn = conns[slot].as_mut().unwrap();
+                let space = BUF_SIZE - conn.buf_len;
+                if space == 0 {
+                    close_conn(slot, &mut conns, epfd);
+                    continue;
+                }
+                let n = unsafe {
+                    libc::recv(conn.fd, conn.buf.as_mut_ptr().add(conn.buf_len) as *mut libc::c_void, space, 0)
+                };
+                if n <= 0 {
+                    close_conn(slot, &mut conns, epfd);
+                    continue;
+                }
+                conn.buf_len += n as usize;
+
+                if let Some(resp) = try_process_one(conn) {
+                    conn.write_resp = resp;
+                    conn.write_pos = 0;
+                    let fd = conn.fd;
+                    epoll_mod(epfd, fd, libc::EPOLLOUT as u32, slot as u64);
+                }
+                // no complete request yet — stay EPOLLIN
+            }
+
+            if evflags & libc::EPOLLOUT as u32 != 0 {
+                let conn = conns[slot].as_mut().unwrap();
+                let remaining = &conn.write_resp[conn.write_pos..];
+                let n = unsafe {
+                    libc::send(conn.fd, remaining.as_ptr() as *const libc::c_void, remaining.len(), 0)
+                };
+                if n < 0 {
+                    close_conn(slot, &mut conns, epfd);
+                    continue;
+                }
+                conn.write_pos += n as usize;
+                if conn.write_pos < conn.write_resp.len() {
+                    // partial send — stay EPOLLOUT
+                    continue;
+                }
+
+                // Response fully sent. Check for pipelined request.
+                let fd = conn.fd;
+                if let Some(resp) = try_process_one(conn) {
+                    conn.write_resp = resp;
+                    conn.write_pos = 0;
+                    // stay EPOLLOUT
+                } else {
+                    epoll_mod(epfd, fd, libc::EPOLLIN as u32, slot as u64);
+                }
             }
         }
     }

@@ -1,6 +1,5 @@
 use flate2::read::GzDecoder;
 use serde::Deserialize;
-use std::cell::UnsafeCell;
 use std::ffi::CString;
 
 const DIMS: usize = 14;
@@ -27,7 +26,27 @@ const FAST_T: [i64; 6] = [
     12_204_271, // count=5
 ];
 
-const MAGIC: &[u8; 8] = b"RINHA005";
+const MAGIC: &[u8; 8] = b"RINHA006";
+
+// Coarse pre-filter: 16x16 grid over the two highest-variance dims. Each cluster
+// is registered in every grid cell its AABB intersects, expanded by ±BUCKET_RADIUS
+// cells on each side so queries near a cell boundary still find the right clusters.
+//
+// At query time we read clusters from a single cell — drops AABB LB calls from
+// NUM_CLUSTERS (4096) to typically 200–500.
+const BUCKETS_PER_DIM: usize = 16;
+const BUCKETS_TOTAL: usize = BUCKETS_PER_DIM * BUCKETS_PER_DIM; // 256
+const BUCKET_RADIUS: i32 = 2;
+const BUCKET_RANGE_HALF: i32 = SCALE as i32; // 10000
+// each cell is 2*BUCKET_RANGE_HALF / BUCKETS_PER_DIM wide on a disc dim
+const BUCKET_WIDTH: i32 = (2 * BUCKET_RANGE_HALF) / BUCKETS_PER_DIM as i32; // 1250
+
+#[inline(always)]
+fn bucket_axis(v: i16) -> i32 {
+    let shifted = (v as i32) + BUCKET_RANGE_HALF;
+    let raw = shifted / BUCKET_WIDTH;
+    raw.clamp(0, BUCKETS_PER_DIM as i32 - 1)
+}
 
 #[derive(Deserialize)]
 struct RefEntry {
@@ -232,11 +251,67 @@ impl Mmap {
     }
 }
 
-// ---------- Thread-local scratch (single-threaded server) ----------
+// ---------- Streaming top-K cluster selector (max-heap, size = FULL_NPROBE) ----------
+//
+// Replaces the prior scratch[NUM_CLUSTERS] + select_nth_unstable + sort sequence.
+// During the AABB LB pass we insert (lb, cluster_id) packed as u64 (lb<<12 | c).
+// After the pass we drain into ascending order for probing.
 
-struct ScratchCell(UnsafeCell<[u64; NUM_CLUSTERS]>);
-unsafe impl Sync for ScratchCell {}
-static SCRATCH: ScratchCell = ScratchCell(UnsafeCell::new([0u64; NUM_CLUSTERS]));
+const PROBE_CAP: usize = FULL_NPROBE;
+
+struct ProbeHeap {
+    packed: [u64; PROBE_CAP],
+    count: usize,
+}
+
+impl ProbeHeap {
+    #[inline(always)]
+    fn new() -> Self {
+        Self { packed: [u64::MAX; PROBE_CAP], count: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, p: u64) {
+        if self.count < PROBE_CAP {
+            let pos = self.count;
+            self.packed[pos] = p;
+            self.count += 1;
+            self.sift_up(pos);
+        } else if p < self.packed[0] {
+            self.packed[0] = p;
+            self.sift_down(0, self.count);
+        }
+    }
+    fn sift_up(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let parent = (pos - 1) / 2;
+            if self.packed[parent] < self.packed[pos] {
+                self.packed.swap(parent, pos);
+                pos = parent;
+            } else { break; }
+        }
+    }
+    fn sift_down(&mut self, mut pos: usize, end: usize) {
+        loop {
+            let left = 2 * pos + 1;
+            let right = 2 * pos + 2;
+            let mut largest = pos;
+            if left < end && self.packed[left] > self.packed[largest] { largest = left; }
+            if right < end && self.packed[right] > self.packed[largest] { largest = right; }
+            if largest == pos { break; }
+            self.packed.swap(pos, largest);
+            pos = largest;
+        }
+    }
+    /// In-place heapsort: after this call, `packed[..count]` is ascending.
+    fn into_ascending(&mut self) -> &[u64] {
+        let n = self.count;
+        for end in (1..n).rev() {
+            self.packed.swap(0, end);
+            self.sift_down(0, end);
+        }
+        &self.packed[..n]
+    }
+}
 
 // ---------- IvfIndex ----------
 
@@ -252,6 +327,10 @@ pub struct IvfIndex {
     block_labels: *const u8,
     block_counts: *const u8,
     pair_blocks: *const i16,        // n_blocks × 7 × 16 × i16
+    // Coarse 16x16 grid on disc dims. bucket_start has BUCKETS_TOTAL+1 entries;
+    // bucket_cids[bucket_start[b]..bucket_start[b+1]] = candidate cluster ids for bucket b.
+    bucket_start: *const u32,
+    bucket_cids: *const u16,
 }
 
 unsafe impl Send for IvfIndex {}
@@ -352,6 +431,43 @@ impl IvfIndex {
             // padded dims 14, 15 stay 0 (q's padded also 0, gap=0, no contribution)
         }
 
+        // Coarse 16x16 bucket grid on disc dims (disc_a, disc_b).
+        // For each cluster, compute its bucket-id range on each disc dim from AABB,
+        // expand by ±BUCKET_RADIUS, and register the cluster in every (ba, bb) cell
+        // in that expanded range.
+        eprintln!("[ivf] building coarse grid {}×{} radius={}...",
+            BUCKETS_PER_DIM, BUCKETS_PER_DIM, BUCKET_RADIUS);
+        let mut bucket_lists: Vec<Vec<u16>> = (0..BUCKETS_TOTAL).map(|_| Vec::new()).collect();
+        for c in 0..NUM_CLUSTERS {
+            if cluster_len[c] == 0 { continue; }
+            let amin = aabb_min_pad[c][disc_a];
+            let amax = aabb_max_pad[c][disc_a];
+            let bmin = aabb_min_pad[c][disc_b];
+            let bmax = aabb_max_pad[c][disc_b];
+            let ba_lo = (bucket_axis(amin) - BUCKET_RADIUS).max(0) as usize;
+            let ba_hi = (bucket_axis(amax) + BUCKET_RADIUS).min(BUCKETS_PER_DIM as i32 - 1) as usize;
+            let bb_lo = (bucket_axis(bmin) - BUCKET_RADIUS).max(0) as usize;
+            let bb_hi = (bucket_axis(bmax) + BUCKET_RADIUS).min(BUCKETS_PER_DIM as i32 - 1) as usize;
+            for ba in ba_lo..=ba_hi {
+                for bb in bb_lo..=bb_hi {
+                    bucket_lists[ba * BUCKETS_PER_DIM + bb].push(c as u16);
+                }
+            }
+        }
+        let mut bucket_start: Vec<u32> = Vec::with_capacity(BUCKETS_TOTAL + 1);
+        let mut bucket_cids: Vec<u16> = Vec::new();
+        let mut acc = 0u32;
+        bucket_start.push(0);
+        for b in 0..BUCKETS_TOTAL {
+            bucket_cids.extend_from_slice(&bucket_lists[b]);
+            acc += bucket_lists[b].len() as u32;
+            bucket_start.push(acc);
+        }
+        let avg_per_bucket = bucket_cids.len() / BUCKETS_TOTAL.max(1);
+        let max_per_bucket = bucket_lists.iter().map(|l| l.len()).max().unwrap_or(0);
+        eprintln!("[ivf] grid: {} cluster refs, avg {}/bucket, max {}/bucket",
+            bucket_cids.len(), avg_per_bucket, max_per_bucket);
+
         eprintln!("[ivf] packing pair blocks...");
         let n_blocks: usize = (0..NUM_CLUSTERS).map(|c| {
             let l = cluster_len[c] as usize;
@@ -406,6 +522,8 @@ impl IvfIndex {
             block_labels,
             block_counts,
             pair_blocks,
+            bucket_start,
+            bucket_cids,
         }
     }
 
@@ -443,10 +561,22 @@ impl IvfIndex {
             off = (off + 1) & !1;
             let pair_blocks = base.add(off) as *const i16;
             off += n_blocks * PAIRS * 16 * 2;
+
+            // bucket_start (u32, BUCKETS_TOTAL+1) — align to 4
+            off = (off + 3) & !3;
+            let bucket_start = base.add(off) as *const u32;
+            off += (BUCKETS_TOTAL + 1) * 4;
+
+            // bucket_cids length = bucket_start[BUCKETS_TOTAL] — peek last entry
+            let bucket_cids_len = *bucket_start.add(BUCKETS_TOTAL) as usize;
+            // align to 2 for u16
+            off = (off + 1) & !1;
+            let bucket_cids = base.add(off) as *const u16;
+            off += bucket_cids_len * 2;
             assert!(off <= mmap.len, "index truncated: off={} len={}", off, mmap.len);
 
-            eprintln!("[ivf] mmap loaded ({} clusters, {} blocks, {} bytes)",
-                n_clusters, n_blocks, mmap.len);
+            eprintln!("[ivf] mmap loaded ({} clusters, {} blocks, {} cluster-refs in grid, {} bytes)",
+                n_clusters, n_blocks, bucket_cids_len, mmap.len);
             IvfIndex {
                 _mmap: mmap,
                 n_clusters,
@@ -458,6 +588,8 @@ impl IvfIndex {
                 block_labels,
                 block_counts,
                 pair_blocks,
+                bucket_start,
+                bucket_cids,
             }
         }
     }
@@ -479,30 +611,38 @@ impl IvfIndex {
             }
         }
 
-        // Compute AABB LB for all clusters → packed (lb<<12 | c)
-        let scratch: &mut [u64; NUM_CLUSTERS] = unsafe { &mut *SCRATCH.0.get() };
+        // Coarse grid lookup on disc dims gives the candidate cluster list.
+        let disc_a = self.pair_dims[0] as usize;
+        let disc_b = self.pair_dims[1] as usize;
+        let ba = bucket_axis(q[disc_a]) as usize;
+        let bb = bucket_axis(q[disc_b]) as usize;
+        let bid = ba * BUCKETS_PER_DIM + bb;
+        let (cands_ptr, cands_len) = unsafe {
+            let lo = *self.bucket_start.add(bid) as usize;
+            let hi = *self.bucket_start.add(bid + 1) as usize;
+            (self.bucket_cids.add(lo), hi - lo)
+        };
+
+        // Streaming top-K over candidates only.
+        let mut heap = ProbeHeap::new();
         unsafe {
-            for c in 0..self.n_clusters {
+            for i in 0..cands_len {
+                let c = *cands_ptr.add(i) as usize;
                 let lb = aabb_lb_one(
                     q_pad.as_ptr(),
                     self.aabb_min_pad.add(c * DIMS_PAD),
                     self.aabb_max_pad.add(c * DIMS_PAD),
                 );
-                // pack: lb (52 bits) << 12 | c (12 bits)
                 let lb_u = (lb as u64) & 0x000F_FFFF_FFFF_FFFF;
-                scratch[c] = (lb_u << 12) | (c as u64);
+                heap.push((lb_u << 12) | (c as u64));
             }
         }
-
-        // Partial sort: select top FULL_NPROBE smallest (fast pass also drawn from this).
-        let probe_cap = FULL_NPROBE.min(self.n_clusters);
-        scratch[..self.n_clusters].select_nth_unstable(probe_cap - 1);
-        let top = &mut scratch[..probe_cap];
-        top.sort_unstable();
+        let top = heap.into_ascending();
+        let probe_cap = top.len();
 
         let mut top5 = Top5::new();
 
-        // FAST pass: first FAST_NPROBE clusters
+        // FAST pass
         let fast = FAST_NPROBE.min(probe_cap);
         for pi in 0..fast {
             let packed = top[pi];
@@ -514,8 +654,7 @@ impl IvfIndex {
 
         // Decide escalation
         let count = top5.fraud_count() as usize;
-        let needs_full = top5.full()
-            && top5.worst() >= FAST_T[count];
+        let needs_full = top5.full() && top5.worst() >= FAST_T[count];
 
         if needs_full {
             for pi in fast..probe_cap {
@@ -544,25 +683,38 @@ impl IvfIndex {
                 qpairs[p] = std::arch::x86_64::_mm256_set1_epi32(packed as i32);
             }
         }
-        let scratch: &mut [u64; NUM_CLUSTERS] = unsafe { &mut *SCRATCH.0.get() };
+
+        let _ = nprobe; // capped at PROBE_CAP; ProbeHeap handles the limit
+        let mut heap = ProbeHeap::new();
+
+        let disc_a = self.pair_dims[0] as usize;
+        let disc_b = self.pair_dims[1] as usize;
+        let ba = bucket_axis(q[disc_a]) as usize;
+        let bb = bucket_axis(q[disc_b]) as usize;
+        let bid = ba * BUCKETS_PER_DIM + bb;
+        let (cands_ptr, cands_len) = unsafe {
+            let lo = *self.bucket_start.add(bid) as usize;
+            let hi = *self.bucket_start.add(bid + 1) as usize;
+            (self.bucket_cids.add(lo), hi - lo)
+        };
+
         unsafe {
-            for c in 0..self.n_clusters {
+            for i in 0..cands_len {
+                let c = *cands_ptr.add(i) as usize;
                 let lb = aabb_lb_one(
                     q_pad.as_ptr(),
                     self.aabb_min_pad.add(c * DIMS_PAD),
                     self.aabb_max_pad.add(c * DIMS_PAD),
                 );
                 let lb_u = (lb as u64) & 0x000F_FFFF_FFFF_FFFF;
-                scratch[c] = (lb_u << 12) | (c as u64);
+                heap.push((lb_u << 12) | (c as u64));
             }
         }
-        let probe_cap = nprobe.min(self.n_clusters);
-        scratch[..self.n_clusters].select_nth_unstable(probe_cap - 1);
-        let top = &mut scratch[..probe_cap];
-        top.sort_unstable();
+
+        let top = heap.into_ascending();
 
         let mut top5 = Top5::new();
-        for pi in 0..probe_cap {
+        for pi in 0..top.len() {
             let packed = top[pi];
             let c = (packed & 0xFFF) as usize;
             let lb = (packed >> 12) as i64;
@@ -572,7 +724,6 @@ impl IvfIndex {
         (top5.fraud_count(), if top5.full() { top5.worst() } else { i64::MAX })
     }
 
-    #[inline(always)]
     fn probe_cluster(
         &self,
         c: usize,
@@ -623,6 +774,8 @@ pub struct BuiltIndex {
     block_labels: Vec<u8>,
     block_counts: Vec<u8>,
     pair_blocks: Vec<i16>,
+    bucket_start: Vec<u32>, // BUCKETS_TOTAL + 1 entries
+    bucket_cids: Vec<u16>,  // contiguous candidate cluster ids
 }
 
 impl BuiltIndex {
@@ -660,13 +813,33 @@ impl BuiltIndex {
 
         f.write_all(bytes_of_slice(&self.pair_blocks)).unwrap();
 
-        let total = 40
+        // Align to 4 for bucket_start (u32). pair_blocks end is not always 4-aligned
+        // because n_blocks*226 mod 4 = n_blocks*2 mod 4 (226 = 4*56+2).
+        let pos_after_pair_blocks = 40
             + (self.aabb_min_pad.len() + self.aabb_max_pad.len()) * DIMS_PAD * 2
             + self.cluster_meta.len() * 8
             + self.block_labels.len() + self.block_counts.len()
             + (after_labels & 1)
             + self.pair_blocks.len() * 2;
-        eprintln!("[ivf] saved index ({} blocks, {} bytes)", n_blocks, total);
+        let pad4 = (4 - (pos_after_pair_blocks & 3)) & 3;
+        f.write_all(&[0u8, 0u8, 0u8][..pad4]).unwrap();
+
+        // bucket_start: BUCKETS_TOTAL+1 u32s = 1028 bytes (4-aligned); next pos stays 4-aligned.
+        // 4-aligned → already 2-aligned, so no extra pad before bucket_cids.
+        f.write_all(bytes_of_slice(&self.bucket_start)).unwrap();
+        f.write_all(bytes_of_slice(&self.bucket_cids)).unwrap();
+
+        let total = 40
+            + (self.aabb_min_pad.len() + self.aabb_max_pad.len()) * DIMS_PAD * 2
+            + self.cluster_meta.len() * 8
+            + self.block_labels.len() + self.block_counts.len()
+            + (after_labels & 1)
+            + self.pair_blocks.len() * 2
+            + pad4
+            + self.bucket_start.len() * 4
+            + self.bucket_cids.len() * 2;
+        eprintln!("[ivf] saved index ({} blocks, {} cluster-refs in grid, {} bytes)",
+            n_blocks, self.bucket_cids.len(), total);
     }
 }
 

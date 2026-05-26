@@ -178,6 +178,16 @@ fn main() {
     let leaked: &'static mut ivf::IvfIndex = Box::leak(Box::new(index));
     IDX_PTR.store(leaked as *mut _, Ordering::Release);
 
+    unsafe {
+        let ret = libc::mlockall(libc::MCL_CURRENT);
+        if ret != 0 {
+            let e = *libc::__errno_location();
+            eprintln!("[main] mlockall failed errno={} (continuing)", e);
+        } else {
+            eprintln!("[main] mlockall ok");
+        }
+    }
+
     try_sched_fifo();
 
     let listen_fd = make_unix_listener(&sock_path);

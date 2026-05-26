@@ -11,8 +11,9 @@ const KMEANS_ITERS: usize = 30;
 const K: usize = 5;
 const SCALE: f32 = 10000.0;
 
-const FULL_NPROBE: usize = 16;
-const FAST_NPROBE: usize = FULL_NPROBE;
+const FAST_NPROBE: usize = 16;
+const FULL_NPROBE: usize = 64;
+const REPAIR_NPROBE: usize = 128;
 
 // Per-count fast→full escalation thresholds. Index by fraud_count after fast pass.
 // If worst_dist >= FAST_T[count], rerun with FULL_NPROBE.
@@ -120,6 +121,19 @@ impl Top5 {
     }
     fn fraud_count(&self) -> u8 {
         self.fraud[..self.count].iter().sum()
+    }
+    fn kernel_fraud_index(&self) -> u8 {
+        const ALPHA: f32 = 5e-8;
+        let mut fraud_w = 0.0f32;
+        let mut total_w = 0.0f32;
+        for i in 0..self.count {
+            let w = (-self.dist[i] as f32 * ALPHA).exp();
+            total_w += w;
+            if self.fraud[i] == 1 { fraud_w += w; }
+        }
+        if total_w == 0.0 { return 0; }
+        let score = fraud_w / total_w;
+        (score * 5.0 + 0.5).min(5.0) as u8
     }
 }
 
@@ -257,7 +271,7 @@ impl Mmap {
 // During the AABB LB pass we insert (lb, cluster_id) packed as u64 (lb<<12 | c).
 // After the pass we drain into ascending order for probing.
 
-const PROBE_CAP: usize = FULL_NPROBE;
+const PROBE_CAP: usize = REPAIR_NPROBE;
 
 struct ProbeHeap {
     packed: [u64; PROBE_CAP],
@@ -639,12 +653,14 @@ impl IvfIndex {
         }
         let top = heap.into_ascending();
         let probe_cap = top.len();
+        let fast_end = FAST_NPROBE.min(probe_cap);
+        let full_end = FULL_NPROBE.min(probe_cap);
+        let repair_end = REPAIR_NPROBE.min(probe_cap);
 
         let mut top5 = Top5::new();
 
-        // FAST pass
-        let fast = FAST_NPROBE.min(probe_cap);
-        for pi in 0..fast {
+        // Phase 1: fast pass
+        for pi in 0..fast_end {
             let packed = top[pi];
             let c = (packed & 0xFFF) as usize;
             let lb = (packed >> 12) as i64;
@@ -652,12 +668,11 @@ impl IvfIndex {
             self.probe_cluster(c, &qpairs, &mut top5);
         }
 
-        // Decide escalation
-        let count = top5.fraud_count() as usize;
-        let needs_full = top5.full() && top5.worst() >= FAST_T[count];
-
-        if needs_full {
-            for pi in fast..probe_cap {
+        // Phase 2: full pass if result is uncertain
+        let count_fast = top5.fraud_count() as usize;
+        let do_full = top5.full() && top5.worst() >= FAST_T[count_fast];
+        if do_full && full_end > fast_end {
+            for pi in fast_end..full_end {
                 let packed = top[pi];
                 let c = (packed & 0xFFF) as usize;
                 let lb = (packed >> 12) as i64;
@@ -666,7 +681,22 @@ impl IvfIndex {
             }
         }
 
-        top5.fraud_count()
+        // Phase 3: repair pass for ambiguous count=2 or 3
+        let count_full = top5.fraud_count() as usize;
+        if count_full == 2 || count_full == 3 {
+            let repair_start = if do_full { full_end } else { fast_end };
+            for pi in repair_start..repair_end {
+                let packed = top[pi];
+                let c = (packed & 0xFFF) as usize;
+                let lb = (packed >> 12) as i64;
+                if top5.full() && lb >= top5.worst() { break; }
+                self.probe_cluster(c, &qpairs, &mut top5);
+                let cnt = top5.fraud_count() as usize;
+                if cnt <= 1 || cnt >= 4 { break; }
+            }
+        }
+
+        top5.kernel_fraud_index()
     }
 
     /// Single-pass query with a custom nprobe. Returns (fraud_count, worst_dist).

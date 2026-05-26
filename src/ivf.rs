@@ -11,7 +11,7 @@ const KMEANS_ITERS: usize = 30;
 const K: usize = 5;
 const SCALE: f32 = 10000.0;
 
-const FULL_NPROBE: usize = 24;
+const FULL_NPROBE: usize = 16;
 const FAST_NPROBE: usize = FULL_NPROBE;
 
 // Per-count fast→full escalation thresholds. Index by fraud_count after fast pass.
@@ -26,20 +26,20 @@ const FAST_T: [i64; 6] = [
     12_204_271, // count=5
 ];
 
-const MAGIC: &[u8; 8] = b"RINHA006";
+const MAGIC: &[u8; 8] = b"RINHA008";
 
-// Coarse pre-filter: 16x16 grid over the two highest-variance dims. Each cluster
+// Coarse pre-filter: 32x32 grid over the two highest-variance dims. Each cluster
 // is registered in every grid cell its AABB intersects, expanded by ±BUCKET_RADIUS
 // cells on each side so queries near a cell boundary still find the right clusters.
 //
 // At query time we read clusters from a single cell — drops AABB LB calls from
-// NUM_CLUSTERS (4096) to typically 200–500.
-const BUCKETS_PER_DIM: usize = 16;
-const BUCKETS_TOTAL: usize = BUCKETS_PER_DIM * BUCKETS_PER_DIM; // 256
+// NUM_CLUSTERS (4096) to typically 100–300.
+const BUCKETS_PER_DIM: usize = 32;
+const BUCKETS_TOTAL: usize = BUCKETS_PER_DIM * BUCKETS_PER_DIM; // 1024
 const BUCKET_RADIUS: i32 = 2;
 const BUCKET_RANGE_HALF: i32 = SCALE as i32; // 10000
 // each cell is 2*BUCKET_RANGE_HALF / BUCKETS_PER_DIM wide on a disc dim
-const BUCKET_WIDTH: i32 = (2 * BUCKET_RANGE_HALF) / BUCKETS_PER_DIM as i32; // 1250
+const BUCKET_WIDTH: i32 = (2 * BUCKET_RANGE_HALF) / BUCKETS_PER_DIM as i32; // 625
 
 #[inline(always)]
 fn bucket_axis(v: i16) -> i32 {
@@ -327,7 +327,7 @@ pub struct IvfIndex {
     block_labels: *const u8,
     block_counts: *const u8,
     pair_blocks: *const i16,        // n_blocks × 7 × 16 × i16
-    // Coarse 16x16 grid on disc dims. bucket_start has BUCKETS_TOTAL+1 entries;
+    // Coarse 32x32 grid on disc dims. bucket_start has BUCKETS_TOTAL+1 entries;
     // bucket_cids[bucket_start[b]..bucket_start[b+1]] = candidate cluster ids for bucket b.
     bucket_start: *const u32,
     bucket_cids: *const u16,
@@ -431,7 +431,7 @@ impl IvfIndex {
             // padded dims 14, 15 stay 0 (q's padded also 0, gap=0, no contribution)
         }
 
-        // Coarse 16x16 bucket grid on disc dims (disc_a, disc_b).
+        // Coarse 32x32 bucket grid on disc dims (disc_a, disc_b).
         // For each cluster, compute its bucket-id range on each disc dim from AABB,
         // expand by ±BUCKET_RADIUS, and register the cluster in every (ba, bb) cell
         // in that expanded range.
@@ -648,7 +648,7 @@ impl IvfIndex {
             let packed = top[pi];
             let c = (packed & 0xFFF) as usize;
             let lb = (packed >> 12) as i64;
-            if top5.full() && lb >= top5.worst() { continue; }
+            if top5.full() && lb >= top5.worst() { break; }
             self.probe_cluster(c, &qpairs, &mut top5);
         }
 
@@ -684,7 +684,6 @@ impl IvfIndex {
             }
         }
 
-        let _ = nprobe; // capped at PROBE_CAP; ProbeHeap handles the limit
         let mut heap = ProbeHeap::new();
 
         let disc_a = self.pair_dims[0] as usize;
@@ -714,7 +713,7 @@ impl IvfIndex {
         let top = heap.into_ascending();
 
         let mut top5 = Top5::new();
-        for pi in 0..top.len() {
+        for pi in 0..top.len().min(nprobe) {
             let packed = top[pi];
             let c = (packed & 0xFFF) as usize;
             let lb = (packed >> 12) as i64;
@@ -824,7 +823,7 @@ impl BuiltIndex {
         let pad4 = (4 - (pos_after_pair_blocks & 3)) & 3;
         f.write_all(&[0u8, 0u8, 0u8][..pad4]).unwrap();
 
-        // bucket_start: BUCKETS_TOTAL+1 u32s = 1028 bytes (4-aligned); next pos stays 4-aligned.
+        // bucket_start: BUCKETS_TOTAL+1 u32s = 4100 bytes (4-aligned); next pos stays 4-aligned.
         // 4-aligned → already 2-aligned, so no extra pad before bucket_cids.
         f.write_all(bytes_of_slice(&self.bucket_start)).unwrap();
         f.write_all(bytes_of_slice(&self.bucket_cids)).unwrap();

@@ -1,6 +1,6 @@
 services:
   lb:
-    image: docker.io/goveialucas/rinha-2026-lb:42ef213
+    image: docker.io/goveialucas/rinha-2026-lb:871813d
     volumes:
       - sock:/run/sock
     ports:
@@ -11,6 +11,8 @@ services:
     networks:
       - rinha
     restart: always
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 65536
@@ -18,11 +20,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.1"
           memory: "30m"
 
   api1:
-    image: docker.io/goveialucas/rinha-2026:42ef213
+    image: docker.io/goveialucas/rinha-2026:871813d
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -30,6 +32,11 @@ services:
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
@@ -40,11 +47,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
+          cpus: "0.45"
           memory: "160m"
 
   api2:
-    image: docker.io/goveialucas/rinha-2026:42ef213
+    image: docker.io/goveialucas/rinha-2026:871813d
     environment:
       SOCK: /run/sock/api2.sock
     volumes:
@@ -52,6 +59,11 @@ services:
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
@@ -62,7 +74,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
+          cpus: "0.45"
           memory: "160m"
 
 networks:

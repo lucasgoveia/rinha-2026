@@ -30,6 +30,7 @@ services:
       dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api1.sock
+      FAST_NPROBE: "4"
     volumes:
       - sock:/run/sock
     networks:
@@ -59,6 +60,7 @@ services:
       dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api2.sock
+      FAST_NPROBE: "4"
     volumes:
       - sock:/run/sock
     networks:

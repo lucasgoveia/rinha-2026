@@ -11,8 +11,6 @@ services:
     networks:
       - rinha
     restart: always
-    security_opt:
-      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 65536
@@ -23,11 +21,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.2"
           memory: "30m"
 
   api1:
-    image: localhost/rinha-2026_api:latest
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api1.sock
     volumes:
@@ -50,11 +50,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "160m"
 
   api2:
-    image: localhost/rinha-2026_api:latest
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api2.sock
     volumes:
@@ -77,7 +79,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "160m"
 
 networks:

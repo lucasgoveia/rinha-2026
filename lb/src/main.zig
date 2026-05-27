@@ -283,12 +283,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 var client_addrlen: posix.socklen_t = @sizeOf(linux.sockaddr.in);
                 const crc = linux.accept4(listen_fd, @ptrCast(&client_addr), &client_addrlen, linux.SOCK.NONBLOCK);
                 const cfd: i32 = @bitCast(@as(u32, @truncate(crc)));
-                if (cfd >= 0) {
-                    var nodelay: i32 = 1;
-                    // IPPROTO_TCP=6, TCP_NODELAY=1
-                    _ = linux.setsockopt(cfd, 6, 1, @ptrCast(&nodelay), @sizeOf(i32));
-                    newRelay(cfd);
-                }
+                if (cfd >= 0) newRelay(cfd);
                 continue;
             }
 

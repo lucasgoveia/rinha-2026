@@ -1,6 +1,6 @@
 services:
   lb:
-    image: docker.io/goveialucas/rinha-2026-lb:871813d
+    image: docker.io/goveialucas/rinha-2026-lb:9957c63
     volumes:
       - sock:/run/sock
     ports:
@@ -15,21 +15,35 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    sysctls:
+      - net.core.somaxconn=65535
+      - net.ipv4.tcp_syncookies=0
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.2"
           memory: "30m"
 
   api1:
-    image: docker.io/goveialucas/rinha-2026:871813d
+    image: docker.io/goveialucas/rinha-2026:9957c63
     environment:
       SOCK: /run/sock/api1.sock
+      FAST_NPROBE: "5"
+      FAST_T1: "4431050"
+      FAST_T2: "3827690"
+      FAST_T3: "3749606"
+      FAST_T4: "2951139"
+      FAST_T5: "4279942"
     volumes:
       - sock:/run/sock
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
@@ -40,18 +54,29 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "160m"
 
   api2:
-    image: docker.io/goveialucas/rinha-2026:871813d
+    image: docker.io/goveialucas/rinha-2026:9957c63
     environment:
       SOCK: /run/sock/api2.sock
+      FAST_NPROBE: "5"
+      FAST_T1: "4431050"
+      FAST_T2: "3827690"
+      FAST_T3: "3749606"
+      FAST_T4: "2951139"
+      FAST_T5: "4279942"
     volumes:
       - sock:/run/sock
     networks:
       - rinha
     restart: always
+    cap_add:
+      - IPC_LOCK
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 16384
@@ -62,7 +87,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "160m"
 
 networks:

@@ -168,7 +168,14 @@ unsafe fn scan_block_avx2(
         _mm256_madd_epi16(d, d)
     };
 
-    let g0 = _mm256_add_epi32(p0, madd_pair(1));        // pairs 0+1
+    let g0 = _mm256_add_epi32(p0, madd_pair(1));        // pairs 0+1 (4 dims, max 1.6e9 < i32::MAX)
+
+    // Second early exit: 4-dim partial sum. Same i32 guard as above.
+    if full && worst >= 0 && worst <= i32::MAX as i64 {
+        let cmp = _mm256_cmpgt_epi32(_mm256_set1_epi32(worst as i32), g0);
+        if _mm256_testz_si256(cmp, cmp) != 0 { return None; }
+    }
+
     let g1 = _mm256_add_epi32(madd_pair(2), madd_pair(3));
     let g2 = _mm256_add_epi32(madd_pair(4), madd_pair(5));
     let g3 = madd_pair(6);
@@ -308,6 +315,9 @@ pub struct IvfIndex {
     #[allow(dead_code)]
     n_blocks: usize,
     fast_nprobe: usize,
+    // Per-count escalation thresholds: skip full probe if top5.worst() < fast_t[count].
+    // i64::MAX = always escalate (safe default). Tuned offline via bin/tune.
+    fast_t: [i64; 6],
     pair_dims: [u8; DIMS],          // pair_dims[2*p..2*p+2] = dims in pair p; pair 0 = disc
     aabb_min_pad: *const i16,       // n_clusters × 16 × i16
     aabb_max_pad: *const i16,
@@ -568,13 +578,25 @@ impl IvfIndex {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(FULL_NPROBE)
                 .min(FULL_NPROBE);
-            eprintln!("[ivf] mmap loaded ({} clusters, {} blocks, {} cluster-refs in grid, {} bytes, fast_nprobe={})",
-                n_clusters, n_blocks, bucket_cids_len, mmap.len, fast_nprobe);
+            let parse_t = |var: &str| std::env::var(var).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(i64::MAX);
+            let fast_t = [
+                i64::MAX,          // count=0: handled by `count > 0` guard, never used
+                parse_t("FAST_T1"),
+                parse_t("FAST_T2"),
+                parse_t("FAST_T3"),
+                parse_t("FAST_T4"),
+                parse_t("FAST_T5"),
+            ];
+            eprintln!("[ivf] mmap loaded ({} clusters, {} blocks, {} cluster-refs in grid, {} bytes, fast_nprobe={}, fast_t={:?})",
+                n_clusters, n_blocks, bucket_cids_len, mmap.len, fast_nprobe, fast_t);
             IvfIndex {
                 _mmap: mmap,
                 n_clusters,
                 n_blocks,
                 fast_nprobe,
+                fast_t,
                 pair_dims,
                 aabb_min_pad,
                 aabb_max_pad,
@@ -646,9 +668,10 @@ impl IvfIndex {
             self.probe_cluster(c, &qpairs, &mut top5);
         }
 
-        // Escalate everything except clear count=0 (all legit) to full FULL_NPROBE clusters.
+        // Escalate if heap not full OR fraud found AND fast pass wasn't confident.
+        // When top5.worst() < fast_t[count], the fast pass result is reliable — skip.
         let count = top5.fraud_count() as usize;
-        if !top5.full() || count > 0 {
+        if !top5.full() || (count > 0 && top5.worst() >= self.fast_t[count]) {
             for pi in fast..probe_cap {
                 let packed = top[pi];
                 let c = (packed & 0xFFF) as usize;

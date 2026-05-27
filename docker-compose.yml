@@ -30,7 +30,12 @@ services:
       dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api1.sock
-      FAST_NPROBE: "4"
+      FAST_NPROBE: "5"
+      FAST_T1: "4431050"
+      FAST_T2: "3827690"
+      FAST_T3: "3749606"
+      FAST_T4: "2951139"
+      FAST_T5: "4279942"
     volumes:
       - sock:/run/sock
     networks:
@@ -60,7 +65,12 @@ services:
       dockerfile: rinha-2026/Dockerfile
     environment:
       SOCK: /run/sock/api2.sock
-      FAST_NPROBE: "4"
+      FAST_NPROBE: "5"
+      FAST_T1: "4431050"
+      FAST_T2: "3827690"
+      FAST_T3: "3749606"
+      FAST_T4: "2951139"
+      FAST_T5: "4279942"
     volumes:
       - sock:/run/sock
     networks:

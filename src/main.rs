@@ -56,6 +56,34 @@ fn make_unix_listener(path: &str) -> i32 {
     }
 }
 
+// Receive a client TCP fd sent by the LB via SCM_RIGHTS.
+// Returns -1 on EAGAIN or error (caller should break the drain loop).
+// ctrl_fd must be nonblocking.
+unsafe fn recv_fd(ctrl_fd: i32) -> i32 {
+    let mut dummy = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // CMSG_SPACE(sizeof(int)) on Linux x86_64:
+    //   cmsghdr = 16 bytes (len:8 + level:4 + type:4)
+    //   CMSG_ALIGN(4) = 8 bytes for the fd
+    //   total = 24 bytes
+    let mut cmsg_buf = [0u8; 24];
+    let mut msg: libc::msghdr = std::mem::zeroed();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_buf.len() as _;
+    let n = libc::recvmsg(ctrl_fd, &mut msg, libc::MSG_DONTWAIT);
+    if n <= 0 { return -1; }
+    let cmsg = libc::CMSG_FIRSTHDR(&msg);
+    if cmsg.is_null() { return -1; }
+    let cm = &*cmsg;
+    if cm.cmsg_level != libc::SOL_SOCKET || cm.cmsg_type != libc::SCM_RIGHTS { return -1; }
+    *(libc::CMSG_DATA(cmsg) as *const i32)
+}
+
 #[inline(always)]
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 { return None; }
@@ -148,7 +176,9 @@ fn try_sched_fifo() {
     }
 }
 
+// Epoll userdata sentinels
 const SLOT_ACCEPT: u64 = u64::MAX;
+const SLOT_CTRL: u64 = u64::MAX - 1;
 
 #[inline(always)]
 fn epoll_mod(epfd: i32, fd: i32, events: u32, slot: u64) {
@@ -161,6 +191,26 @@ fn close_conn(slot: usize, conns: &mut [Option<Conn>; MAX_CONNS], epfd: i32) {
         unsafe {
             libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, c.fd, std::ptr::null_mut());
             libc::close(c.fd);
+        }
+    }
+}
+
+fn add_client(fd: i32, conns: &mut [Option<Conn>; MAX_CONNS], epfd: i32) {
+    match conns.iter().position(|c| c.is_none()) {
+        None => unsafe { libc::close(fd); },
+        Some(slot) => {
+            conns[slot] = Some(Conn {
+                fd,
+                buf: [0; BUF_SIZE],
+                buf_len: 0,
+                write_resp: b"",
+                write_pos: 0,
+            });
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: slot as u64,
+            };
+            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
         }
     }
 }
@@ -180,6 +230,7 @@ fn main() {
 
     try_sched_fifo();
 
+    // Unix socket acts as control channel: LB connects once and sends client fds via SCM_RIGHTS.
     let listen_fd = make_unix_listener(&sock_path);
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -192,8 +243,10 @@ fn main() {
         Box::new(std::array::from_fn(|_| None));
 
     let mut epevents = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
-    // Snapshot buffer to avoid borrow conflicts during processing.
     let mut batch: Vec<(u64, u32)> = Vec::with_capacity(256);
+
+    // ctrl_fd: the single persistent control connection from the LB.
+    let mut ctrl_fd: i32 = -1;
 
     loop {
         let n = unsafe {
@@ -211,6 +264,7 @@ fn main() {
         }
 
         for &(ud, evflags) in &batch {
+            // ── Accept LB control connection ──────────────────────────────────
             if ud == SLOT_ACCEPT {
                 loop {
                     let fd = unsafe {
@@ -218,27 +272,46 @@ fn main() {
                             libc::SOCK_NONBLOCK)
                     };
                     if fd < 0 { break; }
-                    match conns.iter().position(|c| c.is_none()) {
-                        None => unsafe { libc::close(fd); },
-                        Some(slot) => {
-                            conns[slot] = Some(Conn {
-                                fd,
-                                buf: [0; BUF_SIZE],
-                                buf_len: 0,
-                                write_resp: b"",
-                                write_pos: 0,
-                            });
-                            let mut ev = libc::epoll_event {
-                                events: libc::EPOLLIN as u32,
-                                u64: slot as u64,
-                            };
-                            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+                    // Close any stale control connection (LB restart).
+                    if ctrl_fd >= 0 {
+                        unsafe {
+                            libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, ctrl_fd, std::ptr::null_mut());
+                            libc::close(ctrl_fd);
                         }
+                    }
+                    ctrl_fd = fd;
+                    let mut cev = libc::epoll_event {
+                        events: (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+                        u64: SLOT_CTRL,
+                    };
+                    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ctrl_fd, &mut cev) };
+                    eprintln!("[api] LB control connection established");
+                }
+                continue;
+            }
+
+            // ── Receive new client fds from LB ───────────────────────────────
+            if ud == SLOT_CTRL {
+                if evflags & (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32 != 0 {
+                    eprintln!("[api] LB control connection lost");
+                    unsafe {
+                        libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, ctrl_fd, std::ptr::null_mut());
+                        libc::close(ctrl_fd);
+                    }
+                    ctrl_fd = -1;
+                    continue;
+                }
+                if evflags & libc::EPOLLIN as u32 != 0 {
+                    loop {
+                        let new_fd = unsafe { recv_fd(ctrl_fd) };
+                        if new_fd < 0 { break; }
+                        add_client(new_fd, &mut conns, epfd);
                     }
                 }
                 continue;
             }
 
+            // ── Handle client connection ──────────────────────────────────────
             let slot = ud as usize;
             if conns[slot].is_none() { continue; }
 
@@ -269,7 +342,6 @@ fn main() {
                     let fd = conn.fd;
                     epoll_mod(epfd, fd, libc::EPOLLOUT as u32, slot as u64);
                 }
-                // no complete request yet — stay EPOLLIN
             }
 
             if evflags & libc::EPOLLOUT as u32 != 0 {
@@ -284,16 +356,13 @@ fn main() {
                 }
                 conn.write_pos += n as usize;
                 if conn.write_pos < conn.write_resp.len() {
-                    // partial send — stay EPOLLOUT
                     continue;
                 }
 
-                // Response fully sent. Check for pipelined request.
                 let fd = conn.fd;
                 if let Some(resp) = try_process_one(conn) {
                     conn.write_resp = resp;
                     conn.write_pos = 0;
-                    // stay EPOLLOUT
                 } else {
                     epoll_mod(epfd, fd, libc::EPOLLIN as u32, slot as u64);
                 }
